@@ -4,6 +4,9 @@ use anyhow::{anyhow, Result};
 use tokio_postgres::Client;
 
 /// Represents a pool of Postgres database connections.
+///
+/// The `PostgresPool` struct manages a pool of Postgres connections. It allows acquiring and releasing
+/// connections, and ensures that the maximum number of connections is not exceeded.
 #[derive(Clone)]
 struct PostgresPool {
     connections: Arc<Mutex<Vec<Client>>>,
@@ -11,12 +14,11 @@ struct PostgresPool {
     database_url: String,
 }
 
-/// Represents a pool of Postgres connections.
-///
-/// The `PostgresPool` struct manages a pool of Postgres connections. It allows acquiring and releasing
-/// connections, and ensures that the maximum number of connections is not exceeded.
+
 impl PostgresPool {
     /// Creates a new `PostgresPool` instance.
+    ///
+    /// This method creates a new `PostgresPool` instance with the specified `database_url` and `max_connections`.
     ///
     /// # Arguments
     ///
@@ -26,8 +28,24 @@ impl PostgresPool {
     /// # Returns
     ///
     /// A new `PostgresPool` instance.
-    fn new(database_url: &str, max_connections: usize) -> Self {
+    async fn new(database_url: &str, max_connections: usize) -> Self {
         let connections = Arc::new(Mutex::new(Vec::new()));
+
+        for _ in 0..max_connections {
+            let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+                .await
+                .unwrap();
+
+            // The connection object performs the actual communication with the database,
+            // so spawn it off to run on its own.
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("connection error: {}", e);
+                }
+            });
+
+            connections.lock().unwrap().push(client);
+        }
 
         PostgresPool {
             connections,
@@ -39,20 +57,19 @@ impl PostgresPool {
     /// Retrieves a connection from the pool.
     ///
     /// This method attempts to acquire a connection from the pool. If a connection is available, it is
-    /// returned immediately. If no connection is available and the maximum number of connections has not
-    /// been reached, a new connection is established and returned. If the maximum number of connections
+    /// returned immediately. If the maximum number of connections
     /// has been reached, an error is returned.
     ///
     /// # Returns
     ///
     /// A `Result` containing the acquired `Client` connection if successful, or an error if the maximum
     /// number of connections has been reached.
-    async fn get_connection(&self) -> Result<Client> {
+    async fn get_connection(&self) -> Result<(usize, Client)> {
         let client = {
             let mut connections = self.connections.lock().unwrap();
-
+            let index = connections.len() - 1;
             if let Some(conn) = connections.pop() {
-                Some(conn)
+                Some((index, conn))
             } else if connections.len() < self.max_connections {
                 None
             } else {
@@ -60,16 +77,20 @@ impl PostgresPool {
             }
         };
 
-        if let Some(client) = client {
-            return Ok(client);
+        if let Some((index, client)) = client {
+            return Ok((index, client));
         }
 
-        let (client, _) =
-            tokio_postgres::connect(&self.database_url, tokio_postgres::NoTls).await?;
-
-        Ok(client)
+        Err(anyhow!("Max connections reached"))
     }
 
+    /// Returns a connection to the pool.
+    ///
+    /// This method returns a connection to the pool, making it available for other code to use.
+    ///
+    /// # Arguments
+    ///
+    /// * `client` - The `Client` connection to return to the pool.
     fn return_connection(&self, client: Client) {
         let mut connections = self.connections.lock().unwrap();
         connections.push(client);
@@ -80,17 +101,18 @@ impl PostgresPool {
 async fn main() -> Result<()> {
     let pool = PostgresPool::new(
         "postgresql://postgres:supersecretpassword@localhost:5432/database",
-        10,
-    );
+        5,
+    )
+    .await;
 
     let mut tasks = Vec::new();
 
-    for _ in 0..20 {
+    for _ in 0..100 {
         let pool = pool.clone();
 
         tasks.push(tokio::spawn(async move {
-            let client = pool.get_connection().await.unwrap();
-            println!("Got connection: {:?}", client);
+            let (index, client) = pool.get_connection().await.unwrap();
+            println!("Got connection on client: {:?}", index);
             pool.return_connection(client);
         }));
     }
