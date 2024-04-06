@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use tokio_postgres::{Client, Error};
+use tokio_postgres::Client;
 
 /// Represents a pool of Postgres database connections.
+#[derive(Clone)]
 struct PostgresPool {
     connections: Arc<Mutex<Vec<Client>>>,
     max_connections: usize,
@@ -75,6 +76,28 @@ impl PostgresPool {
     }
 }
 
-fn main() {
-    println!("Hello, world!");
+#[tokio::main]
+async fn main() -> Result<()> {
+    let pool = PostgresPool::new(
+        "postgresql://postgres:supersecretpassword@localhost:5432/database",
+        10,
+    );
+
+    let mut tasks = Vec::new();
+
+    for _ in 0..20 {
+        let pool = pool.clone();
+
+        tasks.push(tokio::spawn(async move {
+            let client = pool.get_connection().await.unwrap();
+            println!("Got connection: {:?}", client);
+            pool.return_connection(client);
+        }));
+    }
+
+    for task in tasks {
+        task.await?;
+    }
+
+    Ok(())
 }
